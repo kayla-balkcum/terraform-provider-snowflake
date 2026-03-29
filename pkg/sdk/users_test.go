@@ -988,3 +988,212 @@ func Test_User_ToUserType(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkloadIdentity_validate(t *testing.T) {
+	t.Run("valid AWS workload identity", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type: WorkloadIdentityTypeAWS,
+			ARN:  "arn:aws:iam::123456789012:role/MyRole",
+		}
+		require.NoError(t, workloadIdentity.validate())
+	})
+
+	t.Run("valid Azure workload identity", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type:    WorkloadIdentityTypeAzure,
+			Issuer:  "https://login.microsoftonline.com/tenant-id/v2.0",
+			Subject: "managed-identity-object-id",
+		}
+		require.NoError(t, workloadIdentity.validate())
+	})
+
+	t.Run("valid GCP workload identity", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type:    WorkloadIdentityTypeGCP,
+			Subject: "unique-id-of-service-account",
+		}
+		require.NoError(t, workloadIdentity.validate())
+	})
+
+	t.Run("valid OIDC workload identity", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type:    WorkloadIdentityTypeOIDC,
+			Issuer:  "https://issuer.example.com",
+			Subject: "service-account-subject",
+		}
+		require.NoError(t, workloadIdentity.validate())
+	})
+
+	t.Run("valid OIDC workload identity with audience list", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type:             WorkloadIdentityTypeOIDC,
+			Issuer:           "https://issuer.example.com",
+			Subject:          "service-account-subject",
+			OidcAudienceList: []string{"audience1", "audience2"},
+		}
+		require.NoError(t, workloadIdentity.validate())
+	})
+
+	t.Run("missing type", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			ARN: "arn:aws:iam::123456789012:role/MyRole",
+		}
+		require.Error(t, workloadIdentity.validate())
+	})
+
+	t.Run("AWS: missing ARN", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type: WorkloadIdentityTypeAWS,
+		}
+		require.Error(t, workloadIdentity.validate())
+	})
+
+	t.Run("Azure: missing issuer", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type:    WorkloadIdentityTypeAzure,
+			Subject: "managed-identity-object-id",
+		}
+		require.Error(t, workloadIdentity.validate())
+	})
+
+	t.Run("Azure: missing subject", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type:   WorkloadIdentityTypeAzure,
+			Issuer: "https://login.microsoftonline.com/tenant-id/v2.0",
+		}
+		require.Error(t, workloadIdentity.validate())
+	})
+
+	t.Run("GCP: missing subject", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type: WorkloadIdentityTypeGCP,
+		}
+		require.Error(t, workloadIdentity.validate())
+	})
+
+	t.Run("OIDC: missing issuer", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type:    WorkloadIdentityTypeOIDC,
+			Subject: "service-account-subject",
+		}
+		require.Error(t, workloadIdentity.validate())
+	})
+
+	t.Run("OIDC: missing subject", func(t *testing.T) {
+		workloadIdentity := &WorkloadIdentity{
+			Type:   WorkloadIdentityTypeOIDC,
+			Issuer: "https://issuer.example.com",
+		}
+		require.Error(t, workloadIdentity.validate())
+	})
+
+	t.Run("nil workload identity", func(t *testing.T) {
+		var workloadIdentity *WorkloadIdentity
+		require.NoError(t, workloadIdentity.validate())
+	})
+}
+
+func TestToWorkloadIdentityType(t *testing.T) {
+	valid := []struct {
+		input string
+		want  WorkloadIdentityType
+	}{
+		{"AWS", WorkloadIdentityTypeAWS},
+		{"aws", WorkloadIdentityTypeAWS},
+		{"Aws", WorkloadIdentityTypeAWS},
+		{"AZURE", WorkloadIdentityTypeAzure},
+		{"azure", WorkloadIdentityTypeAzure},
+		{"Azure", WorkloadIdentityTypeAzure},
+		{"GCP", WorkloadIdentityTypeGCP},
+		{"gcp", WorkloadIdentityTypeGCP},
+		{"Gcp", WorkloadIdentityTypeGCP},
+		{"OIDC", WorkloadIdentityTypeOIDC},
+		{"oidc", WorkloadIdentityTypeOIDC},
+		{"Oidc", WorkloadIdentityTypeOIDC},
+	}
+
+	invalid := []string{
+		"INVALID",
+		"UNKNOWN",
+		"",
+	}
+
+	for _, tc := range valid {
+		t.Run(tc.input, func(t *testing.T) {
+			got, err := ToWorkloadIdentityType(tc.input)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+
+	for _, tc := range invalid {
+		t.Run(tc, func(t *testing.T) {
+			_, err := ToWorkloadIdentityType(tc)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestUserCreate_WithWorkloadIdentity(t *testing.T) {
+	id := randomAccountObjectIdentifier()
+
+	t.Run("with AWS workload identity", func(t *testing.T) {
+		workloadIdentityString := "(TYPE = AWS ARN = 'arn:aws:iam::123456789012:role/MyRole')"
+		opts := &CreateUserOptions{
+			name: id,
+			ObjectProperties: &UserObjectProperties{
+				WorkloadIdentity: &workloadIdentityString,
+				Type: Pointer(UserTypeService),
+			},
+		}
+		assertOptsValidAndSQLEquals(t, opts, `CREATE USER %s TYPE = SERVICE WORKLOAD_IDENTITY = (TYPE = AWS ARN = 'arn:aws:iam::123456789012:role/MyRole')`, id.FullyQualifiedName())
+	})
+
+	t.Run("with Azure workload identity", func(t *testing.T) {
+		workloadIdentityString := "(TYPE = AZURE ISSUER = 'https://login.microsoftonline.com/tenant-id/v2.0' SUBJECT = 'managed-identity-object-id')"
+		opts := &CreateUserOptions{
+			name: id,
+			ObjectProperties: &UserObjectProperties{
+				WorkloadIdentity: &workloadIdentityString,
+				Type: Pointer(UserTypeService),
+			},
+		}
+		assertOptsValidAndSQLEquals(t, opts, `CREATE USER %s TYPE = SERVICE WORKLOAD_IDENTITY = (TYPE = AZURE ISSUER = 'https://login.microsoftonline.com/tenant-id/v2.0' SUBJECT = 'managed-identity-object-id')`, id.FullyQualifiedName())
+	})
+
+	t.Run("with GCP workload identity", func(t *testing.T) {
+		workloadIdentityString := "(TYPE = GCP SUBJECT = 'unique-id-of-service-account')"
+		opts := &CreateUserOptions{
+			name: id,
+			ObjectProperties: &UserObjectProperties{
+				WorkloadIdentity: &workloadIdentityString,
+				Type: Pointer(UserTypeService),
+			},
+		}
+		assertOptsValidAndSQLEquals(t, opts, `CREATE USER %s TYPE = SERVICE WORKLOAD_IDENTITY = (TYPE = GCP SUBJECT = 'unique-id-of-service-account')`, id.FullyQualifiedName())
+	})
+
+	t.Run("with OIDC workload identity", func(t *testing.T) {
+		workloadIdentityString := "(TYPE = OIDC ISSUER = 'https://issuer.example.com' SUBJECT = 'service-account-subject')"
+		opts := &CreateUserOptions{
+			name: id,
+			ObjectProperties: &UserObjectProperties{
+				WorkloadIdentity: &workloadIdentityString,
+				Type: Pointer(UserTypeService),
+			},
+		}
+		assertOptsValidAndSQLEquals(t, opts, `CREATE USER %s TYPE = SERVICE WORKLOAD_IDENTITY = (TYPE = OIDC ISSUER = 'https://issuer.example.com' SUBJECT = 'service-account-subject')`, id.FullyQualifiedName())
+	})
+
+	t.Run("with OIDC workload identity and audience list", func(t *testing.T) {
+		workloadIdentityString := "(TYPE = OIDC ISSUER = 'https://issuer.example.com' SUBJECT = 'service-account-subject' OIDC_AUDIENCE_LIST = ('audience1', 'audience2'))"
+		opts := &CreateUserOptions{
+			name: id,
+			ObjectProperties: &UserObjectProperties{
+				WorkloadIdentity: &workloadIdentityString,
+				Type: Pointer(UserTypeService),
+			},
+		}
+		assertOptsValidAndSQLEquals(t, opts, `CREATE USER %s TYPE = SERVICE WORKLOAD_IDENTITY = (TYPE = OIDC ISSUER = 'https://issuer.example.com' SUBJECT = 'service-account-subject' OIDC_AUDIENCE_LIST = ('audience1', 'audience2'))`, id.FullyQualifiedName())
+	})
+}

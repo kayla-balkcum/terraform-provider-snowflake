@@ -150,6 +150,43 @@ var userSchema = map[string]*schema.Schema{
 		Optional:    true,
 		Description: "Specifies a comment for the user.",
 	},
+	"workload_identity": {
+		Type:        schema.TypeList,
+		Optional:    true,
+		MaxItems:    1,
+		Description: "Specifies the workload identity that the user will use to authenticate. For more information, see [Workload identity federation](https://docs.snowflake.com/en/user-guide/workload-identity-federation).",
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"type": {
+					Type:             schema.TypeString,
+					Required:         true,
+					ValidateDiagFunc: sdkValidation(sdk.ToWorkloadIdentityType),
+					Description:      "Specifies the type of workload identity. Supported types: 'AWS', 'AZURE', 'GCP', 'OIDC'.",
+				},
+				"arn": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "Specifies the Amazon Resource Name (ARN) for the AWS IAM user or role that will be used for authentication. Required when type is 'AWS'.",
+				},
+				"issuer": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "Specifies the issuer URL. Required when type is 'AZURE' or 'OIDC'.",
+				},
+				"subject": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "Specifies the subject. Required when type is 'AZURE', 'GCP', or 'OIDC'.",
+				},
+				"oidc_audience_list": {
+					Type:        schema.TypeList,
+					Optional:    true,
+					Elem:        &schema.Schema{Type: schema.TypeString},
+					Description: "Specifies the custom audience list for OIDC workload identity. Optional when type is 'OIDC'.",
+				},
+			},
+		},
+	},
 	"disable_mfa": {
 		Type:             schema.TypeString,
 		Optional:         true,
@@ -349,7 +386,66 @@ func GetCreateUserFunc(userType sdk.UserType) func(ctx context.Context, d *schem
 			stringAttributeCreate(d, "rsa_public_key", &opts.ObjectProperties.RSAPublicKey),
 			stringAttributeCreate(d, "rsa_public_key_2", &opts.ObjectProperties.RSAPublicKey2),
 			stringAttributeCreate(d, "comment", &opts.ObjectProperties.Comment),
-			// disable mfa cannot be set in create, alter is run after creation
+			func() error {
+				if v, ok := d.GetOk("workload_identity"); ok && len(v.([]interface{})) > 0 {
+					workloadIdentityData := v.([]interface{})[0].(map[string]interface{})
+					workloadIdentityType := workloadIdentityData["type"].(string)
+
+					parsedType, err := sdk.ToWorkloadIdentityType(workloadIdentityType)
+					if err != nil {
+						return err
+					}
+
+					var workloadIdentityString string
+					switch parsedType {
+					case sdk.WorkloadIdentityTypeAWS:
+						arn := workloadIdentityData["arn"].(string)
+						if arn == "" {
+							return fmt.Errorf("ARN is required for AWS workload identity")
+						}
+						workloadIdentityString = fmt.Sprintf("(TYPE = %s ARN = '%s')", strings.ToUpper(workloadIdentityType), arn)
+					case sdk.WorkloadIdentityTypeAzure:
+						issuer := workloadIdentityData["issuer"].(string)
+						subject := workloadIdentityData["subject"].(string)
+						if issuer == "" || subject == "" {
+							return fmt.Errorf("Issuer and Subject are required for Azure workload identity")
+						}
+						workloadIdentityString = fmt.Sprintf("(TYPE = %s ISSUER = '%s' SUBJECT = '%s')", strings.ToUpper(workloadIdentityType), issuer, subject)
+					case sdk.WorkloadIdentityTypeGCP:
+						subject := workloadIdentityData["subject"].(string)
+						if subject == "" {
+							return fmt.Errorf("Subject is required for GCP workload identity")
+						}
+						workloadIdentityString = fmt.Sprintf("(TYPE = %s SUBJECT = '%s')", strings.ToUpper(workloadIdentityType), subject)
+					case sdk.WorkloadIdentityTypeOIDC:
+						issuer := workloadIdentityData["issuer"].(string)
+						subject := workloadIdentityData["subject"].(string)
+						if issuer == "" || subject == "" {
+							return fmt.Errorf("Issuer and Subject are required for OIDC workload identity")
+						}
+
+						if audienceListRaw, exists := workloadIdentityData["oidc_audience_list"]; exists && audienceListRaw != nil {
+							audienceList := audienceListRaw.([]interface{})
+							if len(audienceList) > 0 {
+								audiences := make([]string, len(audienceList))
+								for i, aud := range audienceList {
+									audiences[i] = aud.(string)
+								}
+								audienceStr := "'" + strings.Join(audiences, "', '") + "'"
+								workloadIdentityString = fmt.Sprintf("(TYPE = %s ISSUER = '%s' SUBJECT = '%s' OIDC_AUDIENCE_LIST = (%s))",
+									strings.ToUpper(workloadIdentityType), issuer, subject, audienceStr)
+							} else {
+								workloadIdentityString = fmt.Sprintf("(TYPE = %s ISSUER = '%s' SUBJECT = '%s')", strings.ToUpper(workloadIdentityType), issuer, subject)
+							}
+						} else {
+							workloadIdentityString = fmt.Sprintf("(TYPE = %s ISSUER = '%s' SUBJECT = '%s')", strings.ToUpper(workloadIdentityType), issuer, subject)
+						}
+					}
+
+					opts.ObjectProperties.WorkloadIdentity = &workloadIdentityString
+				}
+				return nil
+			}(),
 		)
 		if errs != nil {
 			return diag.FromErr(errs)
@@ -509,7 +605,88 @@ func GetReadUserFunc(userType sdk.UserType, withExternalChangesMarking bool) sch
 			setFromStringPropertyIfNotEmpty(d, "rsa_public_key", userDetails.RsaPublicKey),
 			setFromStringPropertyIfNotEmpty(d, "rsa_public_key_2", userDetails.RsaPublicKey2),
 			setFromStringPropertyIfNotEmpty(d, "comment", userDetails.Comment),
-			// can't read disable_mfa
+			func(rd *schema.ResourceData, ud *sdk.UserDetails) error {
+				if ud.WorkloadIdentity != nil && ud.WorkloadIdentity.Value != "" {
+					workloadIdentityStr := ud.WorkloadIdentity.Value
+					workloadIdentity := make(map[string]interface{})
+
+					if typeIndex := strings.Index(workloadIdentityStr, "TYPE ="); typeIndex != -1 {
+						typeStart := typeIndex + 7
+						typeEnd := strings.Index(workloadIdentityStr[typeStart:], " ")
+						if typeEnd == -1 {
+							typeEnd = len(workloadIdentityStr) - typeStart
+						}
+						workloadType := strings.Trim(workloadIdentityStr[typeStart:typeStart+typeEnd], " '\"")
+						workloadIdentity["type"] = workloadType
+
+						switch strings.ToUpper(workloadType) {
+						case "AWS":
+							if arnIndex := strings.Index(workloadIdentityStr, "ARN ="); arnIndex != -1 {
+								arnStart := arnIndex + 6
+								arnValue := strings.Trim(workloadIdentityStr[arnStart:], " '\"()")
+								workloadIdentity["arn"] = arnValue
+							}
+						case "AZURE":
+							if issuerIndex := strings.Index(workloadIdentityStr, "ISSUER ="); issuerIndex != -1 {
+								issuerStart := issuerIndex + 9
+								issuerEnd := strings.Index(workloadIdentityStr[issuerStart:], "'")
+								if issuerEnd != -1 {
+									issuerValue := workloadIdentityStr[issuerStart : issuerStart+issuerEnd]
+									workloadIdentity["issuer"] = strings.Trim(issuerValue, " '\"")
+								}
+							}
+							if subjectIndex := strings.Index(workloadIdentityStr, "SUBJECT ="); subjectIndex != -1 {
+								subjectStart := subjectIndex + 10
+								subjectEnd := strings.Index(workloadIdentityStr[subjectStart:], "'")
+								if subjectEnd == -1 {
+									subjectEnd = len(workloadIdentityStr) - subjectStart
+								}
+								subjectValue := workloadIdentityStr[subjectStart : subjectStart+subjectEnd]
+								workloadIdentity["subject"] = strings.Trim(subjectValue, " '\"()")
+							}
+						case "GCP":
+							if subjectIndex := strings.Index(workloadIdentityStr, "SUBJECT ="); subjectIndex != -1 {
+								subjectStart := subjectIndex + 10
+								subjectValue := strings.Trim(workloadIdentityStr[subjectStart:], " '\"()")
+								workloadIdentity["subject"] = subjectValue
+							}
+						case "OIDC":
+							if issuerIndex := strings.Index(workloadIdentityStr, "ISSUER ="); issuerIndex != -1 {
+								issuerStart := issuerIndex + 9
+								issuerEnd := strings.Index(workloadIdentityStr[issuerStart:], "'")
+								if issuerEnd != -1 {
+									issuerValue := workloadIdentityStr[issuerStart : issuerStart+issuerEnd]
+									workloadIdentity["issuer"] = strings.Trim(issuerValue, " '\"")
+								}
+							}
+							if subjectIndex := strings.Index(workloadIdentityStr, "SUBJECT ="); subjectIndex != -1 {
+								subjectStart := subjectIndex + 10
+								subjectEnd := strings.Index(workloadIdentityStr[subjectStart:], "'")
+								if subjectEnd == -1 {
+									subjectEnd = len(workloadIdentityStr) - subjectStart
+								}
+								subjectValue := workloadIdentityStr[subjectStart : subjectStart+subjectEnd]
+								workloadIdentity["subject"] = strings.Trim(subjectValue, " '\"")
+							}
+							if audienceIndex := strings.Index(workloadIdentityStr, "OIDC_AUDIENCE_LIST ="); audienceIndex != -1 {
+								audienceStart := audienceIndex + 21
+								audienceListStr := strings.Trim(workloadIdentityStr[audienceStart:], " ()")
+								if audienceListStr != "" {
+									audiences := strings.Split(audienceListStr, "', '")
+									cleanAudiences := make([]interface{}, len(audiences))
+									for i, aud := range audiences {
+										cleanAudiences[i] = strings.Trim(aud, " '\"")
+									}
+									workloadIdentity["oidc_audience_list"] = cleanAudiences
+								}
+							}
+						}
+
+						return rd.Set("workload_identity", []map[string]interface{}{workloadIdentity})
+					}
+				}
+				return nil
+			}(d, userDetails),
 			d.Set("user_type", u.Type),
 
 			func(rd *schema.ResourceData, ud *sdk.UserDetails) error {
@@ -597,7 +774,70 @@ func GetUpdateUserFunc(userType sdk.UserType) func(ctx context.Context, d *schem
 			stringAttributeUpdate(d, "rsa_public_key", &setObjectProperties.RSAPublicKey, &unsetObjectProperties.RSAPublicKey),
 			stringAttributeUpdate(d, "rsa_public_key_2", &setObjectProperties.RSAPublicKey2, &unsetObjectProperties.RSAPublicKey2),
 			stringAttributeUpdate(d, "comment", &setObjectProperties.Comment, &unsetObjectProperties.Comment),
-			// disable_mfa handled separately for proper user types,
+			func() error {
+				if d.HasChange("workload_identity") {
+					if v, ok := d.GetOk("workload_identity"); ok && len(v.([]interface{})) > 0 {
+						workloadIdentityData := v.([]interface{})[0].(map[string]interface{})
+						workloadIdentityType := workloadIdentityData["type"].(string)
+
+						parsedType, err := sdk.ToWorkloadIdentityType(workloadIdentityType)
+						if err != nil {
+							return err
+						}
+
+						var workloadIdentityString string
+						switch parsedType {
+						case sdk.WorkloadIdentityTypeAWS:
+							arn := workloadIdentityData["arn"].(string)
+							if arn == "" {
+								return fmt.Errorf("ARN is required for AWS workload identity")
+							}
+							workloadIdentityString = fmt.Sprintf("(TYPE = %s ARN = '%s')", strings.ToUpper(workloadIdentityType), arn)
+						case sdk.WorkloadIdentityTypeAzure:
+							issuer := workloadIdentityData["issuer"].(string)
+							subject := workloadIdentityData["subject"].(string)
+							if issuer == "" || subject == "" {
+								return fmt.Errorf("Issuer and Subject are required for Azure workload identity")
+							}
+							workloadIdentityString = fmt.Sprintf("(TYPE = %s ISSUER = '%s' SUBJECT = '%s')", strings.ToUpper(workloadIdentityType), issuer, subject)
+						case sdk.WorkloadIdentityTypeGCP:
+							subject := workloadIdentityData["subject"].(string)
+							if subject == "" {
+								return fmt.Errorf("Subject is required for GCP workload identity")
+							}
+							workloadIdentityString = fmt.Sprintf("(TYPE = %s SUBJECT = '%s')", strings.ToUpper(workloadIdentityType), subject)
+						case sdk.WorkloadIdentityTypeOIDC:
+							issuer := workloadIdentityData["issuer"].(string)
+							subject := workloadIdentityData["subject"].(string)
+							if issuer == "" || subject == "" {
+								return fmt.Errorf("Issuer and Subject are required for OIDC workload identity")
+							}
+
+							if audienceListRaw, exists := workloadIdentityData["oidc_audience_list"]; exists && audienceListRaw != nil {
+								audienceList := audienceListRaw.([]interface{})
+								if len(audienceList) > 0 {
+									audiences := make([]string, len(audienceList))
+									for i, aud := range audienceList {
+										audiences[i] = aud.(string)
+									}
+									audienceStr := "'" + strings.Join(audiences, "', '") + "'"
+									workloadIdentityString = fmt.Sprintf("(TYPE = %s ISSUER = '%s' SUBJECT = '%s' OIDC_AUDIENCE_LIST = (%s))",
+										strings.ToUpper(workloadIdentityType), issuer, subject, audienceStr)
+								} else {
+									workloadIdentityString = fmt.Sprintf("(TYPE = %s ISSUER = '%s' SUBJECT = '%s')", strings.ToUpper(workloadIdentityType), issuer, subject)
+								}
+							} else {
+								workloadIdentityString = fmt.Sprintf("(TYPE = %s ISSUER = '%s' SUBJECT = '%s')", strings.ToUpper(workloadIdentityType), issuer, subject)
+							}
+						}
+
+						setObjectProperties.WorkloadIdentity = &workloadIdentityString
+					} else {
+						unsetObjectProperties.WorkloadIdentity = sdk.Bool(true)
+					}
+				}
+				return nil
+			}(),
 		)
 		if errs != nil {
 			return diag.FromErr(errs)

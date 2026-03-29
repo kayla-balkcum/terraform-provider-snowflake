@@ -58,6 +58,43 @@ No changes in configuration are required.
 
 Community PR: [#4185](https://github.com/snowflakedb/terraform-provider-snowflake/pull/4185)
 
+### *(new feature)* Task seconds and hours scheduling support
+
+Added support for scheduling tasks using seconds and hours intervals in addition to the existing minutes and cron support. The `snowflake_task` resource now supports:
+
+- `schedule.seconds` - Schedule tasks to run at intervals specified in seconds (e.g., every 30 seconds)
+- `schedule.hours` - Schedule tasks to run at intervals specified in hours (e.g., every 2 hours)
+
+These new scheduling options work alongside the existing `schedule.minutes` and `schedule.using_cron` options. Only one scheduling method can be specified at a time.
+
+**Example usage:**
+
+```terraform
+resource "snowflake_task" "example_seconds" {
+  database      = "my_database"
+  schema        = "my_schema"
+  name          = "my_task_seconds"
+  sql_statement = "SELECT 1"
+  started       = true
+
+  schedule {
+    seconds = 30  # Run every 30 seconds
+  }
+}
+
+resource "snowflake_task" "example_hours" {
+  database      = "my_database"
+  schema        = "my_schema"
+  name          = "my_task_hours"
+  sql_statement = "SELECT 1"
+  started       = true
+
+  schedule {
+    hours = 2  # Run every 2 hours
+  }
+}
+```
+
 ## v2.10.0 ➞ v2.10.1
 
 ### *(bugfix)* Fixed parsing DESCRIBE output for authentication policies
@@ -118,6 +155,17 @@ Now, this behavior is fixed. Here's the list of affected resources:
 - `snowflake_secret_with_client_credentials`
 
 No changes in configuration and state are required.
+
+### *(improvement)* Handling show_output in warehouses
+
+In v2.7.0 ([migration guide](./MIGRATION_GUIDE.md#new-feature-added-support-for-generation-2-standard-warehouses-and-resource-constraints-for-snowpark-optimized-warehouses)),
+we added support for gen2 warehouses. In this change, we added new fields to `show_output`: `generation`, and `resource_constraint`. Before the 2025_07 bundle, the `generation` column was not available in `SHOW WAREHOUSES`. Internally, we dispatched
+`resource_constraint` value based on the warehouse type, and filled the values in the resource state.
+
+The 2025_07 bundle adds the `generation` column (read our [BCR Migration Guide](./SNOWFLAKE_BCR_MIGRATION_GUIDE.md#new-generation-column-in-output-in-show-warehouses)). Now, instead of dispatching the `resource_constraint` value, the provider simply passes the `generation` field from Snowflake to the `show_output`.
+If the bundle is disabled, then the `generation` column is not present in Snowflake, and the providers behaves in the old way.
+
+No changes in the configuration are necessary.
 
 ## v2.9.x ➞ v2.10.0
 
